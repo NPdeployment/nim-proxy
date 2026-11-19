@@ -51,8 +51,16 @@
  *
  * Env:
  *   PORT, HOST, NIM_BASE_URL, DEFAULT_MODEL, MAX_RETRIES,
- *   REQUEST_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, STREAM_MAX_MS,
- *   MAX_BODY_BYTES, CORS_ORIGIN, LOG_LEVEL, IGNORE_CLIENT_AUTH
+ *   REQUEST_TIMEOUT_MS, CONNECT_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS,
+ *   STREAM_MAX_MS, MAX_BODY_BYTES, MAX_UPSTREAM_BODY_BYTES,
+ *   CORS_ORIGIN, LOG_LEVEL, LOG_FORMAT, IGNORE_CLIENT_AUTH,
+ *   PROXY_TOKEN (door auth for public deployments), RATE_LIMIT_RPM,
+ *   TRUST_PROXY
+ *
+ * Production (public deployment):
+ *   Set PROXY_TOKEN so only your clients can use the proxy; set
+ *   IGNORE_CLIENT_AUTH=1 so the NIM key only ever lives on the server;
+ *   optionally RATE_LIMIT_RPM=60 and LOG_FORMAT=json.
  *
  * Requires Node.js 18+ (uses global fetch). No dependencies.
  */
@@ -86,6 +94,10 @@ const CONFIG = {
   corsOrigin: process.env.CORS_ORIGIN || '*',
   ignoreClientAuth: /^(1|true|yes)$/i.test(process.env.IGNORE_CLIENT_AUTH || ''),
   logLevel: (process.env.LOG_LEVEL || 'info').toLowerCase(),
+  logFormat: (process.env.LOG_FORMAT || 'text').toLowerCase(),
+  proxyToken: process.env.PROXY_TOKEN || '',
+  rateLimitRpm: envInt('RATE_LIMIT_RPM', 0), // 0 = disabled
+  trustProxy: !/^(0|false|no|off)$/i.test(process.env.TRUST_PROXY || '1'),
   envApiKey: [process.env.NVIDIA_API_KEY, process.env.NIM_API_KEY,
     process.env.NVIDIA_NIM_API_KEY, process.env.NIM_TOKEN].find(Boolean) || '',
 };
@@ -95,6 +107,16 @@ const LOG_LEVELS = { debug: 10, info: 20, warn: 30, error: 40, silent: 99 };
 function log(level, msg, extra) {
   const threshold = LOG_LEVELS[CONFIG.logLevel] ?? LOG_LEVELS.info;
   if ((LOG_LEVELS[level] ?? 20) < threshold) return;
+  const out = level === 'error' ? console.error
+    : level === 'warn' ? console.warn : console.log;
+  if (CONFIG.logFormat === 'json') {
+    const rec = { ts: new Date().toISOString(), level, msg };
+    if (extra) for (const [k, v] of Object.entries(extra)) {
+      if (v !== undefined) rec[k] = v;
+    }
+    out(JSON.stringify(rec));
+    return;
+  }
   const parts = [];
   if (extra) for (const [k, v] of Object.entries(extra)) {
     if (v === undefined) continue;
@@ -102,9 +124,7 @@ function log(level, msg, extra) {
   }
   const line = `${new Date().toISOString()} ${level.toUpperCase().padEnd(5)} ${msg}` +
     (parts.length ? ' ' + parts.join(' ') : '');
-  if (level === 'error') console.error(line);
-  else if (level === 'warn') console.warn(line);
-  else console.log(line);
+  out(line);
 }
 
 function maskKey(key) {
@@ -120,6 +140,55 @@ function maskKey(key) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const genId = (prefix) => prefix + crypto.randomBytes(9).toString('hex');
 const hasKeys = (o) => !!o && typeof o === 'object' && Object.keys(o).length > 0;
+
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a || ''), 'utf8');
+  const bb = Buffer.from(String(b || ''), 'utf8');
+  if (ba.length === 0 || ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+/** Client IP, honoring X-Forwarded-For when behind a platform proxy. */
+function clientIp(req) {
+  if (CONFIG.trustProxy) {
+    const xff = String(req.headers['x-forwarded-for'] || '');
+    if (xff) {
+      const parts = xff.split(',').map((s) => s.trim()).filter(Boolean);
+      // last entry is the one appended by our own trusted proxy
+      if (parts.length) return parts[parts.length - 1];
+    }
+    const real = req.headers['x-real-ip'];
+    if (real) return String(real);
+  }
+  return req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : 'unknown';
+}
+
+/* In-memory per-IP rate limit (sliding 60s window, no dependencies). */
+const rateBuckets = new Map();
+function checkRateLimit(ip) {
+  if (!CONFIG.rateLimitRpm) return null;
+  const now = Date.now();
+  let b = rateBuckets.get(ip);
+  if (!b || now >= b.resetAt) {
+    b = { count: 0, resetAt: now + 60_000 };
+    rateBuckets.set(ip, b);
+  }
+  b.count++;
+  if (b.count > CONFIG.rateLimitRpm) {
+    return Math.max(1, Math.ceil((b.resetAt - now) / 1000));
+  }
+  if (rateBuckets.size > 20_000) {
+    for (const [k, v] of rateBuckets) if (now >= v.resetAt) rateBuckets.delete(k);
+  }
+  return null;
+}
+function startRateLimitSweeper() {
+  const t = setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of rateBuckets) if (now >= v.resetAt) rateBuckets.delete(k);
+  }, 60_000);
+  if (t.unref) t.unref();
+}
 
 class HttpError extends Error {
   constructor(status, message, type = 'proxy_error', code = null) {
@@ -1524,7 +1593,7 @@ async function handler(req, res) {
   const corsHeaders = {
     'access-control-allow-origin': CONFIG.corsOrigin,
     'access-control-allow-methods': 'GET, POST, OPTIONS',
-    'access-control-allow-headers': 'authorization, content-type, x-api-key, x-request-id, x-model, x-nvidia-*',
+    'access-control-allow-headers': 'authorization, content-type, x-api-key, x-proxy-token, x-proxy-key, x-request-id, x-model, x-nvidia-*',
     'access-control-max-age': '86400',
   };
 
@@ -1536,7 +1605,42 @@ async function handler(req, res) {
     }
 
     if (req.method === 'GET' && (path === '/health' || path === '/healthz')) {
-      return sendJSON(res, 200, { status: 'ok', upstream: CONFIG.baseUrl, model: CONFIG.defaultModel || null }, corsHeaders);
+      return sendJSON(res, 200, { status: 'ok' }, corsHeaders);
+    }
+
+    // --- door auth: PROXY_TOKEN guards everything except CORS + /health ---
+    if (CONFIG.proxyToken) {
+      const provided = firstString(
+        req.headers['x-proxy-token'],
+        req.headers['x-proxy-key'],
+        url.searchParams.get('token'),
+      );
+      if (!safeEqual(provided, CONFIG.proxyToken)) {
+        log('warn', 'rejected request: bad or missing proxy token', {
+          rid, ip: clientIp(req), path,
+        });
+        return sendJSON(res, 401, {
+          error: {
+            message: 'Missing or invalid proxy token. Send it in the x-proxy-token header.',
+            type: 'proxy_authentication_error',
+            code: 'invalid_proxy_token',
+            param: null,
+          },
+        }, { 'x-request-id': rid, 'www-authenticate': 'Bearer' });
+      }
+    }
+
+    // --- per-IP rate limit ---
+    const retryAfter = checkRateLimit(clientIp(req));
+    if (retryAfter != null) {
+      return sendJSON(res, 429, {
+        error: {
+          message: `Rate limit exceeded. Retry in ${retryAfter}s.`,
+          type: 'rate_limit_error',
+          code: 'rate_limited',
+          param: null,
+        },
+      }, { 'x-request-id': rid, 'retry-after': String(retryAfter) });
     }
 
     if (req.method === 'GET' && path === '/') {
@@ -1634,6 +1738,23 @@ function startServer() {
   server.keepAliveTimeout = 65000;
   server.headersTimeout = 70000;
   server.requestTimeout = 0; // we manage timeouts ourselves
+  startRateLimitSweeper();
+
+  // a crash in one request must not take the whole proxy down
+  process.on('uncaughtException', (err) => {
+    log('error', 'uncaught exception (proxy keeps running)', { err: msg2(err), stack: err && err.stack });
+  });
+  process.on('unhandledRejection', (err) => {
+    log('error', 'unhandled rejection (proxy keeps running)', { err: msg2(err) });
+  });
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      log('error', `port ${CONFIG.port} is already in use — set PORT to another value`);
+      process.exit(1);
+    }
+    log('error', 'server error', { err: msg2(err) });
+  });
 
   server.listen(CONFIG.port, CONFIG.host, () => {
     log('info', 'nim-proxy listening', {
@@ -1641,6 +1762,8 @@ function startServer() {
       upstream: CONFIG.baseUrl,
       key: maskKey(CONFIG.envApiKey),
       model: CONFIG.defaultModel || '(per-request)',
+      doorAuth: CONFIG.proxyToken ? 'PROXY_TOKEN' : 'open',
+      rateLimit: CONFIG.rateLimitRpm ? `${CONFIG.rateLimitRpm}/min/ip` : 'off',
       node: process.version,
     });
   });

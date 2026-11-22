@@ -295,6 +295,27 @@ function resolveModel(req, url, body) {
   );
 }
 
+/* --- thinking_effort -> reasoning_effort compatibility shim ---------------
+ * Some client platforms send their reasoning knob as `thinking_effort`
+ * (or nested `thinking.effort`) instead of the OpenAI/NIM standard
+ * `reasoning_effort`. Without this mapping the value never reaches the
+ * model and it silently runs in non-thinking mode. The original field is
+ * left untouched (upstreams ignore it), and a reasoning_effort the client
+ * already sent is never overwritten. This is additive only: bodies without
+ * either field pass through unchanged.
+ */
+function translateThinkingEffort(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  if (body.reasoning_effort != null) return body; // client already sent the standard field
+  let effort;
+  if (body.thinking_effort != null) effort = body.thinking_effort;
+  else if (body.thinking && typeof body.thinking === 'object' && !Array.isArray(body.thinking) && body.thinking.effort != null) effort = body.thinking.effort;
+  if (effort == null) return body;
+  body.reasoning_effort = effort;
+  log('debug', 'mapped thinking_effort -> reasoning_effort', { effort });
+  return body;
+}
+
 /* ------------------------------------------------------------------ */
 /* JSON repair for tool-call arguments                                 */
 /* ------------------------------------------------------------------ */
@@ -1590,10 +1611,16 @@ async function handler(req, res) {
   catch { return sendError(res, 400, 'invalid request URL', 'invalid_request_error', null, rid); }
 
   const path = normalizePath(url.pathname);
+  // Preflight: echo the headers/methods the browser asks for so any
+  // client platform (even ones with unknown custom headers) is allowed.
+  const requestedHeaders = String(req.headers['access-control-request-headers'] || '')
+    .split(',').map((s) => s.trim()).filter(Boolean).join(', ');
   const corsHeaders = {
     'access-control-allow-origin': CONFIG.corsOrigin,
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
-    'access-control-allow-headers': 'authorization, content-type, x-api-key, x-proxy-token, x-proxy-key, x-request-id, x-model, x-nvidia-*',
+    'access-control-allow-methods': 'GET, POST, OPTIONS, PUT, DELETE',
+    'access-control-allow-headers': requestedHeaders ||
+      'authorization, content-type, x-api-key, x-proxy-token, x-proxy-key, x-request-id, x-model, x-nvidia-*',
+    'access-control-expose-headers': 'x-request-id, retry-after, x-upstream-request-id',
     'access-control-max-age': '86400',
   };
 
@@ -1697,6 +1724,7 @@ async function handler(req, res) {
       }
       body.model = model;
       body = sanitizeBody(body);
+      body = translateThinkingEffort(body);
 
       const ctx = { rid, apiKey, started };
       await handleChatCompletions(req, res, url, body, ctx);
@@ -1791,5 +1819,6 @@ module.exports = {
   normalizeChatResponse,
   ChatStreamAssembler,
   createSSEParser,
+  translateThinkingEffort,
 };
 

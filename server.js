@@ -54,6 +54,7 @@
  *   REQUEST_TIMEOUT_MS, CONNECT_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS,
  *   STREAM_MAX_MS, MAX_BODY_BYTES, MAX_UPSTREAM_BODY_BYTES,
  *   CORS_ORIGIN, LOG_LEVEL, LOG_FORMAT, IGNORE_CLIENT_AUTH,
+ *   LOG_REQUESTS=1 (log full chat request bodies, messages redacted),
  *   PROXY_TOKEN (door auth for public deployments), RATE_LIMIT_RPM,
  *   TRUST_PROXY
  *
@@ -95,6 +96,7 @@ const CONFIG = {
   ignoreClientAuth: /^(1|true|yes)$/i.test(process.env.IGNORE_CLIENT_AUTH || ''),
   logLevel: (process.env.LOG_LEVEL || 'info').toLowerCase(),
   logFormat: (process.env.LOG_FORMAT || 'text').toLowerCase(),
+  logRequests: /^(1|true|yes)$/i.test(process.env.LOG_REQUESTS || ''),
   proxyToken: process.env.PROXY_TOKEN || '',
   rateLimitRpm: envInt('RATE_LIMIT_RPM', 0), // 0 = disabled
   trustProxy: !/^(0|false|no|off)$/i.test(process.env.TRUST_PROXY || '1'),
@@ -283,6 +285,42 @@ function sanitizeBody(body) {
     if (PROXY_ONLY_KEYS.has(key.toLowerCase())) delete out[key];
   }
   return out;
+}
+
+/* --- LOG_REQUESTS: full request-body logging (messages redacted) --------- *
+ * When LOG_REQUESTS=1, every /v1/chat/completions request is logged twice:
+ * once exactly as received from the client, once as forwarded to NIM, so
+ * field-name mismatches (e.g. thinking_effort vs reasoning_effort) are
+ * visible in the platform's logs. The body is serialized in full — only
+ * `messages` (conversation content) and credential fields are replaced
+ * with a placeholder. Off by default; additive only.
+ */
+const LOG_BODY_MAX_CHARS = 16000;
+
+function redactBodyForLog(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const out = { ...body };
+  if (Array.isArray(out.messages)) {
+    out.messages = [`[REDACTED ${out.messages.length} message(s)]`];
+  }
+  for (const key of Object.keys(out)) {
+    if (/^(api_?key|authorization|proxy_?token|x-api-key)$/i.test(key)) out[key] = '[REDACTED]';
+  }
+  return out;
+}
+
+function logRequestBody(label, body, extra) {
+  if (!CONFIG.logRequests) return;
+  let serialized;
+  try {
+    serialized = JSON.stringify(redactBodyForLog(body));
+  } catch (err) {
+    serialized = `[unserializable body: ${err && err.message}]`;
+  }
+  if (serialized.length > LOG_BODY_MAX_CHARS) {
+    serialized = serialized.slice(0, LOG_BODY_MAX_CHARS) + '...[truncated]';
+  }
+  log('info', `${label} request body`, { ...extra, body: serialized });
 }
 
 function resolveModel(req, url, body) {
@@ -1384,6 +1422,7 @@ async function handleChatCompletions(req, res, url, body, ctx) {
     headers,
     body: JSON.stringify(body),
   };
+  logRequestBody('outgoing', body, { rid: ctx.rid, url: upstreamUrl });
 
   let lastErr = null;
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
@@ -1714,6 +1753,7 @@ async function handler(req, res) {
     }
 
     if (wantsChat) {
+      logRequestBody('incoming', body, { rid, path });
       if (url.searchParams.get('stream') === 'true') body.stream = true;
       if (url.searchParams.get('stream') === 'false') body.stream = false;
       const model = resolveModel(req, url, body);
@@ -1820,5 +1860,7 @@ module.exports = {
   ChatStreamAssembler,
   createSSEParser,
   translateThinkingEffort,
+  redactBodyForLog,
+  logRequestBody,
 };
 

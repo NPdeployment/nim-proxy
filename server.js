@@ -56,7 +56,8 @@
  *   CORS_ORIGIN, LOG_LEVEL, LOG_FORMAT, IGNORE_CLIENT_AUTH,
  *   LOG_REQUESTS=1 (log full chat request bodies, messages redacted),
  *   PROXY_TOKEN (door auth for public deployments), RATE_LIMIT_RPM,
- *   TRUST_PROXY
+ *   MODEL_RPM + CONCURRENCY_LIMIT (provider pacing gate — queued, not
+ *   rejected; GATE_WINDOW_MS tunes the slot lifetime), TRUST_PROXY
  *
  * Production (public deployment):
  *   Set PROXY_TOKEN so only your clients can use the proxy; set
@@ -99,6 +100,9 @@ const CONFIG = {
   logRequests: /^(1|true|yes)$/i.test(process.env.LOG_REQUESTS || ''),
   proxyToken: process.env.PROXY_TOKEN || '',
   rateLimitRpm: envInt('RATE_LIMIT_RPM', 0), // 0 = disabled
+  modelRpm: envInt('MODEL_RPM', 0), // 0 = disabled; dispatch slots per model per rolling window
+  concurrencyLimit: envInt('CONCURRENCY_LIMIT', 0), // 0 = no gate; global max in-flight provider requests
+  gateWindowMs: envInt('GATE_WINDOW_MS', 60_000), // slot lifetime (default 60s = the spec's 1 minute)
   trustProxy: !/^(0|false|no|off)$/i.test(process.env.TRUST_PROXY || '1'),
   envApiKey: [process.env.NVIDIA_API_KEY, process.env.NIM_API_KEY,
     process.env.NVIDIA_NIM_API_KEY, process.env.NIM_TOKEN].find(Boolean) || '',
@@ -188,6 +192,117 @@ function startRateLimitSweeper() {
   const t = setInterval(() => {
     const now = Date.now();
     for (const [k, v] of rateBuckets) if (now >= v.resetAt) rateBuckets.delete(k);
+  }, 60_000);
+  if (t.unref) t.unref();
+}
+
+/* ------------------------------------------------------------------ */
+/* Provider pacing gate — MODEL_RPM / CONCURRENCY_LIMIT                 */
+/*                                                                     */
+/* MODEL_RPM: per-model pool of dispatch slots. A slot is taken when a  */
+/* request is actually sent to the provider and frees GATE_WINDOW_MS    */
+/* later, capping dispatches to <= MODEL_RPM per rolling window per     */
+/* model (each model has its own pool; the number is shared).           */
+/* CONCURRENCY_LIMIT: global cap on in-flight provider requests         */
+/* (dispatched, not yet fully relayed to the client).                   */
+/*                                                                     */
+/* A slot only frees when BOTH hold: the window elapsed since dispatch  */
+/* AND in-flight below the concurrency limit. Overflow is NOT rejected  */
+/* — it waits in a per-model FIFO queue and is dispatched as slots      */
+/* free. A queued request whose client hangs up is dropped. Internal    */
+/* retries re-admit (each retry is a fresh dispatch and pays a slot).   */
+/* Both vars are opt-in (0 = off, zero behavior change).                */
+/* ------------------------------------------------------------------ */
+const gate = {
+  dispatches: new Map(), // model -> [dispatch timestamps] (rolling window)
+  queues: new Map(),     // model -> [{ queuedAt, closed, resolve, reject }]
+  inflight: 0,           // dispatched to provider, not yet fully relayed
+};
+
+class GateClosed extends Error {
+  constructor() { super('client disconnected while queued'); }
+}
+
+function gateActive() {
+  return CONFIG.modelRpm > 0 || CONFIG.concurrencyLimit > 0;
+}
+
+/** Drop expired dispatch timestamps for a model; return slots in use. */
+function gateTrim(model) {
+  const arr = gate.dispatches.get(model);
+  if (!arr) return 0;
+  const cutoff = Date.now() - CONFIG.gateWindowMs;
+  while (arr.length && arr[0] <= cutoff) arr.shift();
+  return arr.length;
+}
+
+let gateDrainTimer = null;
+function gateScheduleDrain() {
+  if (gateDrainTimer) return;
+  gateDrainTimer = setTimeout(() => { gateDrainTimer = null; gateDrain(); }, 100);
+  if (gateDrainTimer.unref) gateDrainTimer.unref();
+}
+
+/** Admit as many queued requests as slots + concurrency allow, FIFO per model. */
+function gateDrain() {
+  if (!gateActive()) return;
+  for (const [model, q] of gate.queues) {
+    const arr = gate.dispatches.get(model) || [];
+    while (q.length) {
+      const w = q[0];
+      if (w.closed()) { q.shift(); w.reject(new GateClosed()); continue; }
+      const used = gateTrim(model);
+      const rpmOk = CONFIG.modelRpm <= 0 || used < CONFIG.modelRpm;
+      const concOk = CONFIG.concurrencyLimit <= 0 || gate.inflight < CONFIG.concurrencyLimit;
+      if (rpmOk && concOk) {
+        q.shift();
+        arr.push(Date.now());
+        gate.dispatches.set(model, arr);
+        gate.inflight++;
+        w.resolve(Date.now() - w.queuedAt);
+        continue;
+      }
+      break; // head of queue is blocked — later requests keep their place
+    }
+    if (!q.length) gate.queues.delete(model);
+  }
+  if (gate.queues.size) gateScheduleDrain();
+}
+
+/** Wait for a dispatch slot for `model`. Resolves with queue-wait ms (0 if admitted instantly). */
+function gateAdmit(model, closed) {
+  if (!gateActive()) return Promise.resolve(0);
+  return new Promise((resolve, reject) => {
+    let q = gate.queues.get(model);
+    if (!q) { q = []; gate.queues.set(model, q); }
+    q.push({ queuedAt: Date.now(), closed, resolve, reject });
+    gateDrain();
+    if (gate.queues.size) gateScheduleDrain();
+  });
+}
+
+/** Per-attempt release handle: fires once, when the response ends or the client leaves. */
+function gateReleaseHandle(res) {
+  if (!gateActive()) return () => {};
+  let done = false;
+  const rel = () => {
+    if (done) return;
+    done = true;
+    gate.inflight = Math.max(0, gate.inflight - 1);
+    gateDrain();
+  };
+  res.on('finish', rel);
+  res.on('close', rel);
+  return rel;
+}
+
+function startGateSweeper() {
+  const t = setInterval(() => {
+    const cutoff = Date.now() - CONFIG.gateWindowMs;
+    for (const [model, arr] of gate.dispatches) {
+      while (arr.length && arr[0] <= cutoff) arr.shift();
+      if (!arr.length) gate.dispatches.delete(model);
+    }
   }, 60_000);
   if (t.unref) t.unref();
 }
@@ -1422,7 +1537,6 @@ async function handleChatCompletions(req, res, url, body, ctx) {
     headers,
     body: JSON.stringify(body),
   };
-  logRequestBody('outgoing', body, { rid: ctx.rid, url: upstreamUrl });
 
   let lastErr = null;
   for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
@@ -1432,11 +1546,28 @@ async function handleChatCompletions(req, res, url, body, ctx) {
       await sleep(delay);
     }
     let fetched;
+    // provider pacing gate (MODEL_RPM / CONCURRENCY_LIMIT): queue, never reject
+    let releaseGate = () => {};
+    if (gateActive()) {
+      let waited = 0;
+      try {
+        waited = await gateAdmit(body.model, () => req.__abortSignal.aborted);
+      } catch (err) {
+        if (!(err instanceof GateClosed)) throw err;
+        log('debug', 'queued request abandoned by client', { rid: ctx.rid, model: body.model });
+        if (!res.writableEnded) res.end();
+        return;
+      }
+      if (waited > 500) log('debug', 'gate wait', { rid: ctx.rid, model: body.model, waited });
+      releaseGate = gateReleaseHandle(res);
+    }
+    logRequestBody('outgoing', body, { rid: ctx.rid, url: upstreamUrl, attempt });
     try {
       fetched = await fetchUpstream(upstreamUrl, { ...initBase, signal: req.__abortSignal },
         { connectTimeoutMs: CONFIG.connectTimeoutMs });
     } catch (err) {
       lastErr = err instanceof HttpError ? err : { retryAfter: null };
+      releaseGate();
       if (err instanceof HttpError && err.status !== 504) throw err;
       if (attempt >= CONFIG.maxRetries) {
         throw new HttpError(504, 'upstream unreachable: ' + msg2(err), 'upstream_error');
@@ -1451,6 +1582,7 @@ async function handleChatCompletions(req, res, url, body, ctx) {
       if (RETRYABLE_STATUS.has(up.status) && attempt < CONFIG.maxRetries) {
         lastErr = { retryAfter: up.headers.get('retry-after') };
         log('debug', 'upstream error, may retry', { status: up.status, attempt, rid: ctx.rid });
+        releaseGate();
         continue;
       }
       log('warn', 'upstream error', { status: up.status, rid: ctx.rid, model: body.model });
@@ -1803,10 +1935,11 @@ function createServer() {
 
 function startServer() {
   const server = createServer();
-  server.keepAliveTimeout = 65000;
-  server.headersTimeout = 70000;
+  server.keepAliveTimeout = 90000;
+  server.headersTimeout = 95000;
   server.requestTimeout = 0; // we manage timeouts ourselves
   startRateLimitSweeper();
+  startGateSweeper();
 
   // a crash in one request must not take the whole proxy down
   process.on('uncaughtException', (err) => {
@@ -1832,6 +1965,9 @@ function startServer() {
       model: CONFIG.defaultModel || '(per-request)',
       doorAuth: CONFIG.proxyToken ? 'PROXY_TOKEN' : 'open',
       rateLimit: CONFIG.rateLimitRpm ? `${CONFIG.rateLimitRpm}/min/ip` : 'off',
+      gate: gateActive()
+        ? `rpm=${CONFIG.modelRpm || 'off'} conc=${CONFIG.concurrencyLimit || 'off'} window=${CONFIG.gateWindowMs}ms`
+        : 'off',
       node: process.version,
     });
   });
